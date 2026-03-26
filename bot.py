@@ -568,8 +568,11 @@ class TopGainersBot:
                                 logging.info("--------------------------------")
                     else:
                         logging.error("Telegram Listener failed [%s]: %s", resp.status, await resp.text())
+            except asyncio.TimeoutError:
+                # Expected behavior for long polling, just ignore and continue
+                pass
             except Exception as exc:
-                logging.error("Update listener exception: %s", exc)
+                logging.exception("Update listener exception: %s", exc)
             
             await asyncio.sleep(1)
 
