@@ -96,7 +96,7 @@ class DatabaseManager:
         self.db_path = db_path
 
     async def setup(self):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30.0) as db:
             # Optimize for high-concurrency (Render/Linux)
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
@@ -122,7 +122,7 @@ class DatabaseManager:
             await db.commit()
 
     async def is_alert_sent(self, symbol: str, alert_key: str) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30.0) as db:
             async with db.execute(
                 "SELECT 1 FROM alerts WHERE symbol = ? AND alert_key = ? LIMIT 1",
                 (symbol, alert_key)
@@ -130,7 +130,7 @@ class DatabaseManager:
                 return await cursor.fetchone() is not None
 
     async def save_alert(self, symbol: str, alert_key: str, message_text: str = ""):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30.0) as db:
             await db.execute(
                 "INSERT INTO alerts (symbol, alert_key, message_text) VALUES (?, ?, ?)",
                 (symbol, alert_key, message_text)
@@ -138,7 +138,7 @@ class DatabaseManager:
             await db.commit()
 
     async def get_last_alert(self) -> Optional[str]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=30.0) as db:
             async with db.execute(
                 "SELECT message_text FROM alerts ORDER BY timestamp DESC LIMIT 1"
             ) as cursor:
@@ -164,6 +164,7 @@ class TopGainersBot:
         self.stock_symbols: List[SymbolStat] = []
         self.top_symbols_lock = asyncio.Lock()
         self.stock_symbols_lock = asyncio.Lock()
+        self.stock_api_lock = asyncio.Lock()  # Added lock specifically for sequential stock API calls
         self.stop_event = asyncio.Event()
         self.is_scanning = True  # Added flag to control scanning activity
         self.semaphore = asyncio.Semaphore(PARALLEL_SYMBOL_WORKERS)
@@ -216,9 +217,14 @@ class TopGainersBot:
         tasks = [
             self._top_symbols_scheduler(),
             self._signal_scheduler(),
-            self._update_listener(),
             web_server_task
         ]
+        
+        # Optionally disable the listener to avoid 409 Conflict if multiple instances run
+        if os.getenv("DISABLE_TELEGRAM_LISTENER", "no").strip().lower() != "yes":
+            tasks.append(self._update_listener())
+        else:
+            logging.info("Telegram Listener is disabled via environment variable.")
         
         if ENABLE_STOCKS:
             logging.info("Stocks scanning enabled.")
@@ -457,20 +463,38 @@ class TopGainersBot:
     async def evaluate_stock(self, symbol_stat: SymbolStat) -> None:
         """Evaluate a single stock for BB/RSI signals."""
         async with self.semaphore:
-            try:
-                # Slow down requests to avoid Yahoo Finance rate limits
-                await asyncio.sleep(1.5)
-                
-                # yfinance is synchronous, so we run it in a thread to not block the event loop
-                loop = asyncio.get_running_loop()
-                ticker = yf.Ticker(symbol_stat.symbol)
-                
-                # Fetch history
-                # We need at least BB_PERIOD + some buffer
-                hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=STOCK_TIMEFRAME))
-                
-                if hist.empty or len(hist) < BB_PERIOD + 2:
-                    return
+            # We use a separate lock for the API to ensure stock requests are strictly sequential
+            # This is crucial for Yahoo Finance to avoid rate limiting
+            async with self.stock_api_lock:
+                try:
+                    # Slow down requests to avoid Yahoo Finance rate limits
+                    # 2.5 seconds is safer for yfinance
+                    await asyncio.sleep(2.5)
+                    
+                    # Redirect yfinance cache to /tmp to avoid permission/conflict errors in Render
+                    try:
+                        yf.set_tz_cache_location("/tmp/py-yfinance")
+                    except:
+                        pass
+                        
+                    # yfinance is synchronous, so we run it in a thread to not block the event loop
+                    loop = asyncio.get_running_loop()
+                    ticker = yf.Ticker(symbol_stat.symbol)
+                    
+                    # Fetch history
+                    # We need at least BB_PERIOD + some buffer
+                    # Ensure STOCK_TIMEFRAME is just a single string (interval)
+                    interval = STOCK_TIMEFRAME
+                    if not interval or "," in str(interval):
+                        interval = "5m"
+                        
+                    hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=interval))
+                    
+                    if hist.empty or len(hist) < BB_PERIOD + 2:
+                        # Log specific reason if no data
+                        if hist.empty:
+                            logging.debug("Stock %s returned empty history for interval %s", symbol_stat.symbol, interval)
+                        return
 
                 closes = hist['Close'].tolist()
                 current_price = closes[-1]
