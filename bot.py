@@ -36,7 +36,9 @@ MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
 BASE_RETRY_DELAY_SECONDS = float(os.getenv("BASE_RETRY_DELAY_SECONDS", "1.5"))  # Increased from 1.0
 USE_RSI = os.getenv("USE_RSI", "no").strip().lower() == "yes"
 ENABLE_STOCKS = os.getenv("ENABLE_STOCKS", "no").strip().lower() == "yes"
-STOCK_TIMEFRAME = os.getenv("STOCK_TIMEFRAME", "5m").strip() # yfinance: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d...
+_raw_stock_tf = os.getenv("STOCK_TIMEFRAME", "5m").strip()
+# Yahoo Finance supports only ONE interval string. If a list is provided, take the first one.
+STOCK_TIMEFRAME = _raw_stock_tf.split(",")[0].strip() or "5m"
 
 
 @dataclass
@@ -95,6 +97,10 @@ class DatabaseManager:
 
     async def setup(self):
         async with aiosqlite.connect(self.db_path) as db:
+            # Optimize for high-concurrency (Render/Linux)
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -452,6 +458,9 @@ class TopGainersBot:
         """Evaluate a single stock for BB/RSI signals."""
         async with self.semaphore:
             try:
+                # Slow down requests to avoid Yahoo Finance rate limits
+                await asyncio.sleep(1.5)
+                
                 # yfinance is synchronous, so we run it in a thread to not block the event loop
                 loop = asyncio.get_running_loop()
                 ticker = yf.Ticker(symbol_stat.symbol)
