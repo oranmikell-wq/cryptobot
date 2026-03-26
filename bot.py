@@ -203,12 +203,27 @@ class TopGainersBot:
         await self.exchange.load_markets()
         self.exchange_supported_timeframes = set((self.exchange.timeframes or {}).keys())
         await self.refresh_top_symbols()
-        await self.send_telegram(
-            f"Bot started on {self.exchange_id.upper()}. Monitoring top {TOP_N} USDT gainers.\n"
-            f"Market type: {MARKET_TYPE}\n"
-            f"Top list refresh: every {TOP_REFRESH_SECONDS // 60}m\n"
-            f"Bollinger/RSI checks: every {CHECK_INTERVAL_SECONDS // 60}m"
+        
+        # Build comprehensive startup message
+        stocks_status = f"✅ פעיל ({STOCK_TIMEFRAME})" if ENABLE_STOCKS else "❌ כבוי"
+        rsi_status = "✅ פעיל" if USE_RSI else "❌ כבוי"
+        
+        startup_msg = (
+            "🤖 <b>הבוט הופעל בהצלחה!</b>\n\n"
+            "🔍 <b>מה אני סורק?</b>\n"
+            f"• קריפטו ({self.exchange_id.upper()}): {TOP_N} המטבעות הכי עולות ({MARKET_TYPE})\n"
+            f"• מניות (Yahoo): {stocks_status}\n\n"
+            "⏱️ <b>זמני בדיקה:</b>\n"
+            f"• רענון רשימת הכי עולות: כל {TOP_REFRESH_SECONDS // 60} דקות\n"
+            f"• בדיקת איתותים (Signals): כל {CHECK_INTERVAL_SECONDS // 60} דקות\n"
+            f"• טווחי זמן (קריפטו): {', '.join(TIMEFRAMES)}\n\n"
+            "📊 <b>אינדיקטורים פעילים:</b>\n"
+            "• רצועות בולינגר (Bollinger Bands): ✅ פעיל\n"
+            f"• מדד חוזק יחסי (RSI): {rsi_status}\n\n"
+            "🚀 <i>הבוט יתחיל לשלוח איתותים במידה ויזוהו חריגות!</i>"
         )
+        
+        await self.send_telegram(startup_msg)
 
         # 1. Start web server FIRST to satisfy Render health check quickly
         # This prevents Render from starting a second instance while this one is still "starting"
