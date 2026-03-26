@@ -531,49 +531,49 @@ class TopGainersBot:
                             logging.debug("Stock %s returned empty history for interval %s", symbol_stat.symbol, interval)
                         return
 
-                closes = hist['Close'].tolist()
-                current_price = closes[-1]
-                last_candle_ts = int(hist.index[-1].timestamp())
-                
-                lower_band, mean_band, upper_band = bollinger_bands(closes)
-                
-                # BB logic
-                bb_match = current_price > upper_band
-                
-                # RSI logic (if enabled)
-                rsi_match = True
-                current_rsi = None
-                if USE_RSI:
-                    current_rsi = calculate_rsi(closes)
-                    rsi_match = current_rsi > RSI_OVERBOUGHT
-                
-                if bb_match and rsi_match:
-                    alert_key = f"stock_{STOCK_TIMEFRAME}_{last_candle_ts}"
-                    if await self.db.is_alert_sent(symbol_stat.symbol, alert_key):
-                        return
+                    closes = hist['Close'].tolist()
+                    current_price = closes[-1]
+                    last_candle_ts = int(hist.index[-1].timestamp())
+                    
+                    lower_band, mean_band, upper_band = bollinger_bands(closes)
+                    
+                    # BB logic
+                    bb_match = current_price > upper_band
+                    
+                    # RSI logic (if enabled)
+                    rsi_match = True
+                    current_rsi = None
+                    if USE_RSI:
+                        current_rsi = calculate_rsi(closes)
+                        rsi_match = current_rsi > RSI_OVERBOUGHT
+                    
+                    if bb_match and rsi_match:
+                        alert_key = f"stock_{STOCK_TIMEFRAME}_{last_candle_ts}"
+                        if await self.db.is_alert_sent(symbol_stat.symbol, alert_key):
+                            return
 
-                    logging.info("!!! STOCK SIGNAL DETECTED: %s !!!", symbol_stat.symbol)
-                    
-                    exchange_link = self._get_yahoo_link(symbol_stat.symbol)
-                    
-                    rsi_text = f", RSI={current_rsi:.1f}" if current_rsi is not None else ""
-                    msg = (
-                        "📈 <b>STOCK SHORT signal detected</b>\n"
-                        f"Symbol: <b>{symbol_stat.symbol}</b>\n"
-                        f"Type: <i>US Stock</i>\n"
-                        f"Timeframe: {STOCK_TIMEFRAME}\n"
-                        f"Price: {current_price:.2f}, Upper: {upper_band:.2f}{rsi_text}\n\n"
-                        f"🔗 <a href='{exchange_link}'>View on Yahoo Finance</a>"
-                    )
-                    
-                    await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
-                    
-                    chart_buf = self._create_chart(symbol_stat.symbol, closes[-50:], upper_band, lower_band, mean_band, is_stock=True)
-                    await self.send_telegram_photo(chart_buf, msg)
-                    
-                    logging.info("Stock Signal: %s | price=%0.2f", symbol_stat.symbol, current_price)
-            except Exception as exc:
-                logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
+                        logging.info("!!! STOCK SIGNAL DETECTED: %s !!!", symbol_stat.symbol)
+                        
+                        exchange_link = self._get_yahoo_link(symbol_stat.symbol)
+                        
+                        rsi_text = f", RSI={current_rsi:.1f}" if current_rsi is not None else ""
+                        msg = (
+                            "📈 <b>STOCK SHORT signal detected</b>\n"
+                            f"Symbol: <b>{symbol_stat.symbol}</b>\n"
+                            f"Type: <i>US Stock</i>\n"
+                            f"Timeframe: {STOCK_TIMEFRAME}\n"
+                            f"Price: {current_price:.2f}, Upper: {upper_band:.2f}{rsi_text}\n\n"
+                            f"🔗 <a href='{exchange_link}'>View on Yahoo Finance</a>"
+                        )
+                        
+                        await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
+                        
+                        chart_buf = self._create_chart(symbol_stat.symbol, closes[-50:], upper_band, lower_band, mean_band, is_stock=True)
+                        await self.send_telegram_photo(chart_buf, msg)
+                        
+                        logging.info("Stock Signal: %s | price=%0.2f", symbol_stat.symbol, current_price)
+                except Exception as exc:
+                    logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
 
     async def _get_closes_for_timeframe(self, symbol: str, timeframe: str, limit: int) -> Tuple[List[float], int]:
         if timeframe in self.exchange_supported_timeframes:
