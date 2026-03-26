@@ -193,12 +193,19 @@ class TopGainersBot:
             f"Bollinger/RSI checks: every {CHECK_INTERVAL_SECONDS // 60}m"
         )
 
-        # Run bot and a simple web server together
+        # 1. Start web server FIRST to satisfy Render health check quickly
+        # This prevents Render from starting a second instance while this one is still "starting"
+        web_server_task = asyncio.create_task(self._start_dummy_web_server())
+        
+        # Give web server a second to bind to the port
+        await asyncio.sleep(2)
+
+        # 2. Run bot tasks
         await asyncio.gather(
             self._top_symbols_scheduler(),
             self._signal_scheduler(),
             self._update_listener(),
-            self._start_dummy_web_server()
+            web_server_task
         )
 
     async def _start_dummy_web_server(self) -> None:
@@ -208,17 +215,16 @@ class TopGainersBot:
             return web.Response(text="Bot is running!")
         app.router.add_get('/', handle)
         
-        port = int(os.getenv("PORT", "8080"))
+        # Render uses port 10000 by default for its health check
+        port = int(os.getenv("PORT", "10000"))
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', port)
         logging.info("Starting dummy web server on port %s", port)
         await site.start()
         
-        # Keep it alive
-        while not self.stop_event.is_set():
-            await asyncio.sleep(3600)
-        
+        # Wait for shutdown signal
+        await self.stop_event.wait()
         await runner.cleanup()
 
     async def close(self) -> None:
@@ -483,6 +489,11 @@ class TopGainersBot:
 
     async def _update_listener(self) -> None:
         """Listens for incoming messages to help user find Chat IDs."""
+        # Add a startup delay to allow any old instances on Render to shut down
+        # This is a robust way to avoid 409 Conflict during rolling deployments
+        logging.info("Telegram listener will start in 10 seconds...")
+        await asyncio.sleep(10)
+        
         last_update_id = 0
         url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
         
@@ -613,29 +624,27 @@ class TopGainersBot:
 async def main() -> None:
     pid_file = "bot.pid"
     
-    # Check if bot is already running
-    if os.path.exists(pid_file):
+    # Check if bot is already running (Windows local check only)
+    if os.name == "nt" and os.path.exists(pid_file):
         try:
             with open(pid_file, "r") as f:
                 old_pid = int(f.read().strip())
             
-            # Check if process with this PID still exists (Windows specific check)
             import subprocess
             output = subprocess.check_output(f'tasklist /FI "PID eq {old_pid}"', shell=True).decode()
             if str(old_pid) in output:
                 print(f"❌ הבוט כבר רץ (PID: {old_pid})! יש לעצור את הבוט לפני הרצה חדשה.")
                 return
             else:
-                # Process not found, file is stale
                 os.remove(pid_file)
         except Exception:
-            # If any error checking, just remove the stale file
             if os.path.exists(pid_file):
                 os.remove(pid_file)
 
-    # Create PID file
-    with open(pid_file, "w") as f:
-        f.write(str(os.getpid()))
+    # Create PID file only on Windows
+    if os.name == "nt":
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_ids_str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
