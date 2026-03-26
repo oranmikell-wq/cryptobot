@@ -37,8 +37,9 @@ BASE_RETRY_DELAY_SECONDS = float(os.getenv("BASE_RETRY_DELAY_SECONDS", "1.5"))  
 USE_RSI = os.getenv("USE_RSI", "no").strip().lower() == "yes"
 ENABLE_STOCKS = os.getenv("ENABLE_STOCKS", "no").strip().lower() == "yes"
 _raw_stock_tf = os.getenv("STOCK_TIMEFRAME", "5m").strip()
-# Yahoo Finance supports only ONE interval string. If a list is provided, take the first one.
-STOCK_TIMEFRAME = _raw_stock_tf.split(",")[0].strip() or "5m"
+STOCK_TIMEFRAMES = [tf.strip() for tf in _raw_stock_tf.split(",") if tf.strip()]
+if not STOCK_TIMEFRAMES:
+    STOCK_TIMEFRAMES = ["5m"]
 
 
 @dataclass
@@ -205,22 +206,23 @@ class TopGainersBot:
         await self.refresh_top_symbols()
         
         # Build comprehensive startup message
-        stocks_status = f"✅ פעיל ({STOCK_TIMEFRAME})" if ENABLE_STOCKS else "❌ כבוי"
-        rsi_status = "✅ פעיל" if USE_RSI else "❌ כבוי"
+        stocks_status = f"✅ Active ({', '.join(STOCK_TIMEFRAMES)})" if ENABLE_STOCKS else "❌ Disabled"
+        rsi_status = "✅ Active" if USE_RSI else "❌ Disabled"
         
         startup_msg = (
-            "🤖 <b>הבוט הופעל בהצלחה!</b>\n\n"
-            "🔍 <b>מה אני סורק?</b>\n"
-            f"• קריפטו ({self.exchange_id.upper()}): {TOP_N} המטבעות הכי עולות ({MARKET_TYPE})\n"
-            f"• מניות (Yahoo): {stocks_status}\n\n"
-            "⏱️ <b>זמני בדיקה:</b>\n"
-            f"• רענון רשימת הכי עולות: כל {TOP_REFRESH_SECONDS // 60} דקות\n"
-            f"• בדיקת איתותים (Signals): כל {CHECK_INTERVAL_SECONDS // 60} דקות\n"
-            f"• טווחי זמן (קריפטו): {', '.join(TIMEFRAMES)}\n\n"
-            "📊 <b>אינדיקטורים פעילים:</b>\n"
-            "• רצועות בולינגר (Bollinger Bands): ✅ פעיל\n"
-            f"• מדד חוזק יחסי (RSI): {rsi_status}\n\n"
-            "🚀 <i>הבוט יתחיל לשלוח איתותים במידה ויזוהו חריגות!</i>"
+            "🤖 <b>Bot Started Successfully!</b>\n\n"
+            "🔍 <b>Scanning Profile:</b>\n"
+            f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers ({MARKET_TYPE})\n"
+            f"• Stocks (Yahoo): {stocks_status}\n\n"
+            "⏱️ <b>Intervals:</b>\n"
+            f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
+            f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
+            f"• Crypto Timeframes: {', '.join(TIMEFRAMES)}\n"
+            f"• Stock Timeframes: {', '.join(STOCK_TIMEFRAMES)}\n\n"
+            "📊 <b>Active Indicators:</b>\n"
+            "• Bollinger Bands: ✅ Active\n"
+            f"• RSI: {rsi_status}\n\n"
+            "🚀 <i>The bot will now alert when deviations are detected!</i>"
         )
         
         await self.send_telegram(startup_msg)
@@ -496,7 +498,7 @@ class TopGainersBot:
                 logging.warning("Failed symbol %s: %s", symbol_stat.symbol, exc)
 
     async def evaluate_stock(self, symbol_stat: SymbolStat) -> None:
-        """Evaluate a single stock for BB/RSI signals."""
+        """Evaluate a single stock for BB/RSI signals on multiple timeframes."""
         async with self.semaphore:
             # We use a separate lock for the API to ensure stock requests are strictly sequential
             # This is crucial for Yahoo Finance to avoid rate limiting
@@ -516,62 +518,78 @@ class TopGainersBot:
                     loop = asyncio.get_running_loop()
                     ticker = yf.Ticker(symbol_stat.symbol)
                     
-                    # Fetch history
-                    # We need at least BB_PERIOD + some buffer
-                    # Ensure STOCK_TIMEFRAME is just a single string (interval)
-                    interval = STOCK_TIMEFRAME
-                    if not interval or "," in str(interval):
-                        interval = "5m"
+                    all_timeframes_match = True
+                    tf_metrics = []
+                    alert_key_parts = []
+                    
+                    for timeframe in STOCK_TIMEFRAMES:
+                        # Fetch history for each timeframe
+                        hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=timeframe))
                         
-                    hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=interval))
-                    
-                    if hist.empty or len(hist) < BB_PERIOD + 2:
-                        # Log specific reason if no data
-                        if hist.empty:
-                            logging.debug("Stock %s returned empty history for interval %s", symbol_stat.symbol, interval)
-                        return
+                        if hist.empty or len(hist) < BB_PERIOD + 2:
+                            all_timeframes_match = False
+                            break
 
-                    closes = hist['Close'].tolist()
-                    current_price = closes[-1]
-                    last_candle_ts = int(hist.index[-1].timestamp())
-                    
-                    lower_band, mean_band, upper_band = bollinger_bands(closes)
-                    
-                    # BB logic
-                    bb_match = current_price > upper_band
-                    
-                    # RSI logic (if enabled)
-                    rsi_match = True
-                    current_rsi = None
-                    if USE_RSI:
-                        current_rsi = calculate_rsi(closes)
-                        rsi_match = current_rsi > RSI_OVERBOUGHT
-                    
-                    if bb_match and rsi_match:
-                        alert_key = f"stock_{STOCK_TIMEFRAME}_{last_candle_ts}"
+                        closes = hist['Close'].tolist()
+                        current_price = closes[-1]
+                        last_candle_ts = int(hist.index[-1].timestamp())
+                        
+                        lower_band, mean_band, upper_band = bollinger_bands(closes)
+                        
+                        # BB logic
+                        bb_match = current_price > upper_band
+                        
+                        # RSI logic (if enabled)
+                        rsi_match = True
+                        current_rsi = None
+                        if USE_RSI:
+                            current_rsi = calculate_rsi(closes)
+                            rsi_match = current_rsi > RSI_OVERBOUGHT
+                        
+                        if bb_match and rsi_match:
+                            tf_metrics.append((timeframe, current_price, upper_band, current_rsi))
+                            alert_key_parts.append(f"{timeframe}_{last_candle_ts}")
+                        else:
+                            all_timeframes_match = False
+                            break
+
+                    if all_timeframes_match and tf_metrics:
+                        alert_key = f"stock_{'_'.join(alert_key_parts)}"
                         if await self.db.is_alert_sent(symbol_stat.symbol, alert_key):
                             return
 
-                        logging.info("!!! STOCK SIGNAL DETECTED: %s !!!", symbol_stat.symbol)
+                        logging.info("!!! STOCK SIGNAL DETECTED (Multi-TF): %s !!!", symbol_stat.symbol)
                         
                         exchange_link = self._get_yahoo_link(symbol_stat.symbol)
                         
-                        rsi_text = f", RSI={current_rsi:.1f}" if current_rsi is not None else ""
+                        metrics_lines = []
+                        for tf, price, upper, rsi in tf_metrics:
+                            rsi_text = f", RSI={rsi:.1f}" if rsi is not None else ""
+                            metrics_lines.append(f"• {tf}: Price={price:.2f}, Upper={upper:.2f}{rsi_text}")
+                        
+                        metrics_text = "\n".join(metrics_lines)
                         msg = (
-                            "📈 <b>STOCK SHORT signal detected</b>\n"
+                            "📈 <b>STOCK SHORT signal detected (Multi-TF Confirmation)</b>\n"
                             f"Symbol: <b>{symbol_stat.symbol}</b>\n"
                             f"Type: <i>US Stock</i>\n"
-                            f"Timeframe: {STOCK_TIMEFRAME}\n"
-                            f"Price: {current_price:.2f}, Upper: {upper_band:.2f}{rsi_text}\n\n"
+                            f"Confirmed on: {', '.join(STOCK_TIMEFRAMES)}\n"
+                            f"{metrics_text}\n\n"
                             f"🔗 <a href='{exchange_link}'>View on Yahoo Finance</a>"
                         )
                         
                         await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
                         
-                        chart_buf = self._create_chart(symbol_stat.symbol, closes[-50:], upper_band, lower_band, mean_band, is_stock=True)
+                        # Use the last timeframe's data for the chart
+                        last_closes = tf_metrics[-1][1] # This is current price, we need list
+                        # Re-fetching list for the last one
+                        hist_last = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=STOCK_TIMEFRAMES[-1]))
+                        closes_list = hist_last['Close'].tolist()
+                        l, m, u = bollinger_bands(closes_list)
+                        
+                        chart_buf = self._create_chart(symbol_stat.symbol, closes_list[-50:], u, l, m, is_stock=True)
                         await self.send_telegram_photo(chart_buf, msg)
                         
-                        logging.info("Stock Signal: %s | price=%0.2f", symbol_stat.symbol, current_price)
+                        logging.info("Stock Signal: %s | multi-tf confirmed", symbol_stat.symbol)
                 except Exception as exc:
                     logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
 
@@ -783,36 +801,27 @@ class TopGainersBot:
                                         url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
                                         payload = {"chat_id": chat_id, "text": "No signals stored in database yet."}
                                         await self.http_session.post(url_send, json=payload)
-                                elif text == "/ha":
-                                    url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                                    payload = {
-                                        "chat_id": chat_id,
-                                        "text": "חגי זה בן זונה גדול עושה ארגזים",
-                                        "parse_mode": "HTML"
-                                    }
-                                    await self.http_session.post(url_send, json=payload)
                                 elif text == "/start":
                                     self.is_scanning = True
                                     url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                                    payload = {"chat_id": chat_id, "text": "✅ <b>הבוט הופעל!</b> הסריקה מתחילה כעת.", "parse_mode": "HTML"}
+                                    payload = {"chat_id": chat_id, "text": "✅ <b>Scanning Resumed!</b> The bot is now checking for signals.", "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
                                     logging.info("Scanning resumed via Telegram command.")
                                 elif text == "/stop":
                                     self.is_scanning = False
                                     url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-                                    payload = {"chat_id": chat_id, "text": "🛑 <b>הבוט נעצר!</b> הסריקה הופסקה.", "parse_mode": "HTML"}
+                                    payload = {"chat_id": chat_id, "text": "🛑 <b>Scanning Paused!</b> The bot will stop sending alerts.", "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
                                     logging.info("Scanning paused via Telegram command.")
                                 elif text == "/help" or text == "/menu":
                                     url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
                                     help_text = (
-                                        "🤖 <b>תפריט פקודות הבוט:</b>\n\n"
-                                        "▶️ /start - הפעלת סריקת המטבעות\n"
-                                        "🛑 /stop - עצירת סריקת המטבעות\n"
-                                        "📍 /last - הצגת האיתות האחרון שנשלח\n"
-                                        "💰 /ha - פקודת בונוס לחגי\n"
-                                        "❓ /help - הצגת תפריט זה\n\n"
-                                        "<i>הבוט סורק כעת 250 מטבעות ב-5 טווחי זמן.</i>"
+                                        "🤖 <b>Bot Menu:</b>\n\n"
+                                        "▶️ /start - Resume scanning\n"
+                                        "🛑 /stop - Pause scanning\n"
+                                        "📍 /last - Show last signal details\n"
+                                        "❓ /help - Show this menu\n\n"
+                                        f"<i>Scanning {TOP_N} symbols on {len(TIMEFRAMES)} crypto timeframes and {', '.join(STOCK_TIMEFRAMES)} for stocks.</i>"
                                     )
                                     payload = {"chat_id": chat_id, "text": help_text, "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
@@ -874,7 +883,7 @@ async def main() -> None:
             import subprocess
             output = subprocess.check_output(f'tasklist /FI "PID eq {old_pid}"', shell=True).decode()
             if str(old_pid) in output:
-                print(f"❌ הבוט כבר רץ (PID: {old_pid})! יש לעצור את הבוט לפני הרצה חדשה.")
+                print(f"❌ Bot is already running (PID: {old_pid})! Please stop it before starting a new instance.")
                 return
             else:
                 os.remove(pid_file)
