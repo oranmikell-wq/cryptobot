@@ -489,14 +489,24 @@ class TopGainersBot:
 
     async def _update_listener(self) -> None:
         """Listens for incoming messages to help user find Chat IDs."""
-        # Add a startup delay to allow any old instances on Render to shut down
-        # This is a robust way to avoid 409 Conflict during rolling deployments
-        logging.info("Telegram listener will start in 10 seconds...")
-        await asyncio.sleep(10)
+        # Wait a bit for other instances to shut down
+        await asyncio.sleep(5)
         
         last_update_id = 0
         url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
         
+        # Initial call to clear any old updates (skip messages sent while bot was offline)
+        try:
+            async with self.http_session.get(url, params={"offset": -1, "timeout": 1}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("result", [])
+                    if results:
+                        last_update_id = results[-1]["update_id"]
+                        logging.info("Cleared old Telegram updates. Starting listener from update %s", last_update_id)
+        except Exception as exc:
+            logging.warning("Failed to clear initial Telegram updates: %s", exc)
+
         logging.info("ID Listener started. Send a message to the bot in any group to see its Chat ID.")
         
         while not self.stop_event.is_set():
