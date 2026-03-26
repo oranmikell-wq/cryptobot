@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import aiohttp
+from aiohttp import web
 import aiosqlite
 import ccxt.async_support as ccxt
 import matplotlib.pyplot as plt
@@ -192,11 +193,33 @@ class TopGainersBot:
             f"Bollinger/RSI checks: every {CHECK_INTERVAL_SECONDS // 60}m"
         )
 
+        # Run bot and a simple web server together
         await asyncio.gather(
             self._top_symbols_scheduler(),
             self._signal_scheduler(),
-            self._update_listener()
+            self._update_listener(),
+            self._start_dummy_web_server()
         )
+
+    async def _start_dummy_web_server(self) -> None:
+        """Start a simple HTTP server to satisfy Render's health checks (Free tier)."""
+        app = web.Application()
+        async def handle(request):
+            return web.Response(text="Bot is running!")
+        app.router.add_get('/', handle)
+        
+        port = int(os.getenv("PORT", "8080"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        logging.info("Starting dummy web server on port %s", port)
+        await site.start()
+        
+        # Keep it alive
+        while not self.stop_event.is_set():
+            await asyncio.sleep(3600)
+        
+        await runner.cleanup()
 
     async def close(self) -> None:
         if self.http_session and not self.http_session.closed:
