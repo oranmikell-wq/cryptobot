@@ -14,6 +14,8 @@ import aiosqlite
 import ccxt.async_support as ccxt
 import matplotlib.pyplot as plt
 import matplotlib
+import yfinance as yf
+import pandas as pd
 matplotlib.use('Agg') # Use non-interactive backend for server-side chart generation
 
 
@@ -33,6 +35,8 @@ MARKET_TYPE = (os.getenv("MARKET_TYPE", "futures").strip().lower() or "futures")
 MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
 BASE_RETRY_DELAY_SECONDS = float(os.getenv("BASE_RETRY_DELAY_SECONDS", "1.5"))  # Increased from 1.0
 USE_RSI = os.getenv("USE_RSI", "no").strip().lower() == "yes"
+ENABLE_STOCKS = os.getenv("ENABLE_STOCKS", "no").strip().lower() == "yes"
+STOCK_TIMEFRAME = os.getenv("STOCK_TIMEFRAME", "5m").strip() # yfinance: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d...
 
 
 @dataclass
@@ -151,7 +155,9 @@ class TopGainersBot:
             self.exchange = exchange_cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.top_symbols: List[SymbolStat] = []
+        self.stock_symbols: List[SymbolStat] = []
         self.top_symbols_lock = asyncio.Lock()
+        self.stock_symbols_lock = asyncio.Lock()
         self.stop_event = asyncio.Event()
         self.is_scanning = True  # Added flag to control scanning activity
         self.semaphore = asyncio.Semaphore(PARALLEL_SYMBOL_WORKERS)
@@ -201,12 +207,19 @@ class TopGainersBot:
         await asyncio.sleep(2)
 
         # 2. Run bot tasks
-        await asyncio.gather(
+        tasks = [
             self._top_symbols_scheduler(),
             self._signal_scheduler(),
             self._update_listener(),
             web_server_task
-        )
+        ]
+        
+        if ENABLE_STOCKS:
+            logging.info("Stocks scanning enabled.")
+            tasks.append(self._stock_symbols_scheduler())
+            tasks.append(self._stock_signal_scheduler())
+            
+        await asyncio.gather(*tasks)
 
     async def _start_dummy_web_server(self) -> None:
         """Start a simple HTTP server to satisfy Render's health checks (Free tier)."""
@@ -263,6 +276,55 @@ class TopGainersBot:
             self.top_symbols = top
         logging.info("Top list refreshed: %s symbols", len(top))
 
+    async def refresh_top_stocks(self) -> None:
+        """Fetch US stock day gainers from Yahoo Finance."""
+        logging.info("Refreshing top stocks list...")
+        try:
+            # Simple scrape of Yahoo day gainers
+            url = "https://finance.yahoo.com/screener/predefined/day_gainers"
+            # Since yfinance.Screener is sometimes broken, we'll try a simpler approach if needed
+            # For now, let's use a common set of active tickers if screener fails
+            # Actually, yf.Screener() might work for some versions.
+            try:
+                # Mock a list of symbols if screener is not available or reliable
+                # Alternatively, use pandas to read the table if headers are correct
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with self.http_session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        dfs = pd.read_html(html)
+                        if dfs:
+                            df = dfs[0]
+                            # Yahoo table has columns: Symbol, Name, Price, Change, % Change, Volume, Avg Vol (3m), Market Cap, PE Ratio (TTM)
+                            # We want Symbol and % Change
+                            stats = []
+                            for _, row in df.iterrows():
+                                try:
+                                    symbol = str(row['Symbol'])
+                                    pct_change = float(str(row['% Change']).replace('%', '').replace('+', ''))
+                                    price = float(row['Price'])
+                                    volume = float(row['Volume'])
+                                    stats.append(SymbolStat(symbol=symbol, gain_pct=pct_change, last_price=price, quote_volume=volume))
+                                except:
+                                    continue
+                            
+                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
+                            async with self.stock_symbols_lock:
+                                self.stock_symbols = stats[:TOP_N]
+                            logging.info("Top stocks refreshed: %s symbols", len(self.stock_symbols))
+                            return
+            except Exception as e:
+                logging.warning("Failed to scrape Yahoo day gainers: %s", e)
+                
+            # Fallback if scraping fails
+            async with self.stock_symbols_lock:
+                # Just a few big ones for testing if nothing else works
+                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META"]
+                self.stock_symbols = [SymbolStat(s, 0, 0, 0) for s in fallback]
+                logging.info("Using fallback stock list: %s", fallback)
+        except Exception as exc:
+            logging.error("refresh_top_stocks error: %s", exc)
+
     def _get_mexc_link(self, symbol: str) -> str:
         # Converts symbol like BTC/USDT:USDT to BTC_USDT for MEXC
         # For spot: https://www.mexc.com/exchange/BTC_USDT
@@ -273,7 +335,10 @@ class TopGainersBot:
         else:
             return f"https://www.mexc.com/exchange/{clean_symbol}"
 
-    def _create_chart(self, symbol: str, closes: List[float], upper_band: float, lower_band: float, mean_band: float) -> io.BytesIO:
+    def _get_yahoo_link(self, symbol: str) -> str:
+        return f"https://finance.yahoo.com/quote/{symbol}"
+
+    def _create_chart(self, symbol: str, closes: List[float], upper_band: float, lower_band: float, mean_band: float, is_stock: bool = False) -> io.BytesIO:
         plt.figure(figsize=(10, 6))
         plt.plot(closes, label='Price', color='blue', linewidth=1.5)
         
@@ -283,7 +348,8 @@ class TopGainersBot:
         plt.plot(x, [mean_band] * len(closes), label='Middle Band', color='orange', linestyle=':', alpha=0.5)
         plt.plot(x, [lower_band] * len(closes), label='Lower Band', color='green', linestyle='--', alpha=0.7)
         
-        plt.title(f"{symbol} - Bollinger Bands ({TIMEFRAMES[0]})")
+        title_suffix = f"({STOCK_TIMEFRAME})" if is_stock else f"({TIMEFRAMES[0]})"
+        plt.title(f"{symbol} - Bollinger Bands {title_suffix}")
         plt.xlabel("Candles (Last 50)")
         plt.ylabel("Price")
         plt.legend()
@@ -381,6 +447,65 @@ class TopGainersBot:
                     logging.info("Signal(all TF): %s | gain=%0.2f", symbol_stat.symbol, symbol_stat.gain_pct)
             except Exception as exc:
                 logging.warning("Failed symbol %s: %s", symbol_stat.symbol, exc)
+
+    async def evaluate_stock(self, symbol_stat: SymbolStat) -> None:
+        """Evaluate a single stock for BB/RSI signals."""
+        async with self.semaphore:
+            try:
+                # yfinance is synchronous, so we run it in a thread to not block the event loop
+                loop = asyncio.get_running_loop()
+                ticker = yf.Ticker(symbol_stat.symbol)
+                
+                # Fetch history
+                # We need at least BB_PERIOD + some buffer
+                hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=STOCK_TIMEFRAME))
+                
+                if hist.empty or len(hist) < BB_PERIOD + 2:
+                    return
+
+                closes = hist['Close'].tolist()
+                current_price = closes[-1]
+                last_candle_ts = int(hist.index[-1].timestamp())
+                
+                lower_band, mean_band, upper_band = bollinger_bands(closes)
+                
+                # BB logic
+                bb_match = current_price > upper_band
+                
+                # RSI logic (if enabled)
+                rsi_match = True
+                current_rsi = None
+                if USE_RSI:
+                    current_rsi = calculate_rsi(closes)
+                    rsi_match = current_rsi > RSI_OVERBOUGHT
+                
+                if bb_match and rsi_match:
+                    alert_key = f"stock_{STOCK_TIMEFRAME}_{last_candle_ts}"
+                    if await self.db.is_alert_sent(symbol_stat.symbol, alert_key):
+                        return
+
+                    logging.info("!!! STOCK SIGNAL DETECTED: %s !!!", symbol_stat.symbol)
+                    
+                    exchange_link = self._get_yahoo_link(symbol_stat.symbol)
+                    
+                    rsi_text = f", RSI={current_rsi:.1f}" if current_rsi is not None else ""
+                    msg = (
+                        "📈 <b>STOCK SHORT signal detected</b>\n"
+                        f"Symbol: <b>{symbol_stat.symbol}</b>\n"
+                        f"Type: <i>US Stock</i>\n"
+                        f"Timeframe: {STOCK_TIMEFRAME}\n"
+                        f"Price: {current_price:.2f}, Upper: {upper_band:.2f}{rsi_text}\n\n"
+                        f"🔗 <a href='{exchange_link}'>View on Yahoo Finance</a>"
+                    )
+                    
+                    await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
+                    
+                    chart_buf = self._create_chart(symbol_stat.symbol, closes[-50:], upper_band, lower_band, mean_band, is_stock=True)
+                    await self.send_telegram_photo(chart_buf, msg)
+                    
+                    logging.info("Stock Signal: %s | price=%0.2f", symbol_stat.symbol, current_price)
+            except Exception as exc:
+                logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
 
     async def _get_closes_for_timeframe(self, symbol: str, timeframe: str, limit: int) -> Tuple[List[float], int]:
         if timeframe in self.exchange_supported_timeframes:
@@ -486,6 +611,44 @@ class TopGainersBot:
                         logging.error("Telegram photo send to %s failed [%s]: %s", chat_id, resp.status, body)
             except Exception as exc:
                 logging.error("Telegram photo error for %s: %s", chat_id, exc)
+
+    async def _stock_symbols_scheduler(self) -> None:
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                await self.refresh_top_stocks()
+            except Exception as exc:
+                logging.exception("Stock list refresh failed: %s", exc)
+
+            elapsed = time.monotonic() - started
+            wait_for = max(1, int(TOP_REFRESH_SECONDS - elapsed))
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _stock_signal_scheduler(self) -> None:
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                if self.is_scanning:
+                    async with self.stock_symbols_lock:
+                        snapshot = list(self.stock_symbols)
+                    
+                    if snapshot:
+                        logging.info("Checking %s stocks...", len(snapshot))
+                        await asyncio.gather(*(self.evaluate_stock(s) for s in snapshot))
+                else:
+                    logging.info("Stock scanning is currently disabled. Use /start to resume.")
+            except Exception as exc:
+                logging.exception("Stock signal check failed: %s", exc)
+
+            elapsed = time.monotonic() - started
+            wait_for = max(1, int(CHECK_INTERVAL_SECONDS - elapsed))
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
+            except asyncio.TimeoutError:
+                pass
 
     async def _update_listener(self) -> None:
         """Listens for incoming messages to help user find Chat IDs."""
