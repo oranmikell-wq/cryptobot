@@ -1,0 +1,4 @@
+aiohttp
+aiosqlite
+ccxt
+matplotlib

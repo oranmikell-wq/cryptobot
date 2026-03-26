@@ -1,0 +1,18 @@
+# Database
+alerts.db
+alerts.db-journal
+
+# Process lock
+bot.pid
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables (if you ever use a .env file)
+.env
+
+# IDEs
+.vscode/
+.idea/
