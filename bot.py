@@ -194,7 +194,11 @@ class TopGainersBot:
         return True
 
     async def start(self) -> None:
-        self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        # Increase max_field_size for Yahoo Finance headers
+        self.http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            max_field_size=16384
+        )
         await self.db.setup()
         await self.exchange.load_markets()
         self.exchange_supported_timeframes = set((self.exchange.timeframes or {}).keys())
@@ -292,46 +296,62 @@ class TopGainersBot:
         """Fetch US stock day gainers from Yahoo Finance."""
         logging.info("Refreshing top stocks list...")
         try:
-            # Simple scrape of Yahoo day gainers
-            url = "https://finance.yahoo.com/screener/predefined/day_gainers"
-            # Since yfinance.Screener is sometimes broken, we'll try a simpler approach if needed
-            # For now, let's use a common set of active tickers if screener fails
-            # Actually, yf.Screener() might work for some versions.
+            # Try a different URL that is more stable
+            url = "https://finance.yahoo.com/markets/stocks/gainers/"
             try:
                 # Mock a list of symbols if screener is not available or reliable
-                # Alternatively, use pandas to read the table if headers are correct
-                headers = {"User-Agent": "Mozilla/5.0"}
+                # Yahoo Finance can be tricky with scraping, let's try a few standard ones too
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9"
+                }
                 async with self.http_session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         html = await resp.text()
+                        # Use a more specific extraction if read_html fails or gives wrong data
                         dfs = pd.read_html(html)
                         if dfs:
+                            # Usually the first table
                             df = dfs[0]
-                            # Yahoo table has columns: Symbol, Name, Price, Change, % Change, Volume, Avg Vol (3m), Market Cap, PE Ratio (TTM)
-                            # We want Symbol and % Change
+                            # Clean column names if they have weird formatting
+                            df.columns = [str(c).strip() for c in df.columns]
+                            
                             stats = []
+                            # Map columns based on potential names (Yahoo changes them often)
+                            sym_col = next((c for c in df.columns if 'Symbol' in c or 'Ticker' in c), df.columns[0])
+                            pct_col = next((c for c in df.columns if '%' in c or 'Change' in c), None)
+                            price_col = next((c for c in df.columns if 'Price' in c), None)
+                            vol_col = next((c for c in df.columns if 'Volume' in c), None)
+
                             for _, row in df.iterrows():
                                 try:
-                                    symbol = str(row['Symbol'])
-                                    pct_change = float(str(row['% Change']).replace('%', '').replace('+', ''))
-                                    price = float(row['Price'])
-                                    volume = float(row['Volume'])
+                                    symbol = str(row[sym_col]).split()[0] # Take first part in case of "AAPL Apple Inc."
+                                    if pct_col:
+                                        pct_val = str(row[pct_col]).replace('%', '').replace('+', '').replace(',', '')
+                                        pct_change = float(pct_val)
+                                    else:
+                                        pct_change = 0.0
+                                    
+                                    price = float(str(row[price_col]).replace(',', '')) if price_col else 0.0
+                                    volume = float(str(row[vol_col]).replace('M', '000000').replace('K', '000').replace(',', '').replace('B', '000000000')) if vol_col else 0.0
+                                    
                                     stats.append(SymbolStat(symbol=symbol, gain_pct=pct_change, last_price=price, quote_volume=volume))
                                 except:
                                     continue
                             
-                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
-                            async with self.stock_symbols_lock:
-                                self.stock_symbols = stats[:TOP_N]
-                            logging.info("Top stocks refreshed: %s symbols", len(self.stock_symbols))
-                            return
+                            if stats:
+                                stats.sort(key=lambda x: x.gain_pct, reverse=True)
+                                async with self.stock_symbols_lock:
+                                    self.stock_symbols = stats[:TOP_N]
+                                logging.info("Top stocks refreshed: %s symbols", len(self.stock_symbols))
+                                return
             except Exception as e:
                 logging.warning("Failed to scrape Yahoo day gainers: %s", e)
                 
-            # Fallback if scraping fails
+            # Fallback if scraping fails - keep it dynamic by adding some hot tickers
             async with self.stock_symbols_lock:
-                # Just a few big ones for testing if nothing else works
-                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META"]
+                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META", "COIN", "MARA", "RIOT", "MSTR"]
                 self.stock_symbols = [SymbolStat(s, 0, 0, 0) for s in fallback]
                 logging.info("Using fallback stock list: %s", fallback)
         except Exception as exc:
@@ -468,8 +488,8 @@ class TopGainersBot:
             async with self.stock_api_lock:
                 try:
                     # Slow down requests to avoid Yahoo Finance rate limits
-                    # 2.5 seconds is safer for yfinance
-                    await asyncio.sleep(2.5)
+                    # 5.0 seconds with jitter is safer for Render data center IPs
+                    await asyncio.sleep(5.0 + random.uniform(0, 2.0))
                     
                     # Redirect yfinance cache to /tmp to avoid permission/conflict errors in Render
                     try:
