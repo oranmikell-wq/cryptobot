@@ -312,69 +312,92 @@ class TopGainersBot:
         logging.info("Top list refreshed: %s symbols", len(top))
 
     async def refresh_top_stocks(self) -> None:
-        """Fetch US stock day gainers from Yahoo Finance."""
-        logging.info("Refreshing top stocks list...")
+        """Fetch US stock day gainers/trending from Yahoo Finance API."""
+        logging.info("Refreshing top stocks list via Trending API...")
         try:
-            # Try a different URL that is more stable
-            url = "https://finance.yahoo.com/markets/stocks/gainers/"
-            try:
-                # Mock a list of symbols if screener is not available or reliable
-                # Yahoo Finance can be tricky with scraping, let's try a few standard ones too
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9"
-                }
-                async with self.http_session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        html = await resp.text()
-                        # Use a more specific extraction if read_html fails or gives wrong data
-                        dfs = pd.read_html(html)
-                        if dfs:
-                            # Usually the first table
-                            df = dfs[0]
-                            # Clean column names if they have weird formatting
-                            df.columns = [str(c).strip() for c in df.columns]
+            # Use the robust query1 trending endpoint provided in the context
+            url = "https://query1.finance.yahoo.com/v1/finance/trending/US?count=25&fields=symbol,regularMarketChangePercent,regularMarketPrice,quoteType"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            }
+            
+            async with self.http_session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("finance", {}).get("result", [])
+                    if results:
+                        quotes = results[0].get("quotes", [])
+                        stats = []
+                        for q in quotes:
+                            # Filter for EQUITY to avoid overlap with crypto (handled by MEXC)
+                            if q.get("quoteType") != "EQUITY":
+                                continue
+                                
+                            symbol = q.get("symbol")
+                            # Extract percentage change from nested structure
+                            pct_data = q.get("regularMarketChangePercent") or {}
+                            pct_change = float(pct_data.get("raw", 0.0))
                             
-                            stats = []
-                            # Map columns based on potential names (Yahoo changes them often)
-                            sym_col = next((c for c in df.columns if 'Symbol' in c or 'Ticker' in c), df.columns[0])
-                            pct_col = next((c for c in df.columns if '%' in c or 'Change' in c), None)
-                            price_col = next((c for c in df.columns if 'Price' in c), None)
-                            vol_col = next((c for c in df.columns if 'Volume' in c), None)
+                            # Extract price
+                            price_data = q.get("regularMarketPrice") or {}
+                            price = float(price_data.get("raw", 0.0))
+                            
+                            if symbol:
+                                stats.append(SymbolStat(
+                                    symbol=symbol,
+                                    gain_pct=pct_change,
+                                    last_price=price,
+                                    quote_volume=0.0 # Trending API doesn't always provide volume in simple format
+                                ))
+                        
+                        if stats:
+                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
+                            async with self.stock_symbols_lock:
+                                self.stock_symbols = stats
+                            logging.info("Top stocks refreshed via API: %s symbols", len(self.stock_symbols))
+                            return
 
-                            for _, row in df.iterrows():
-                                try:
-                                    symbol = str(row[sym_col]).split()[0] # Take first part in case of "AAPL Apple Inc."
-                                    if pct_col:
-                                        pct_val = str(row[pct_col]).replace('%', '').replace('+', '').replace(',', '')
-                                        pct_change = float(pct_val)
-                                    else:
-                                        pct_change = 0.0
-                                    
-                                    price = float(str(row[price_col]).replace(',', '')) if price_col else 0.0
-                                    volume = float(str(row[vol_col]).replace('M', '000000').replace('K', '000').replace(',', '').replace('B', '000000000')) if vol_col else 0.0
-                                    
-                                    stats.append(SymbolStat(symbol=symbol, gain_pct=pct_change, last_price=price, quote_volume=volume))
-                                except:
-                                    continue
-                            
-                            if stats:
-                                stats.sort(key=lambda x: x.gain_pct, reverse=True)
-                                async with self.stock_symbols_lock:
-                                    self.stock_symbols = stats[:TOP_N]
-                                logging.info("Top stocks refreshed: %s symbols", len(self.stock_symbols))
-                                return
-            except Exception as e:
-                logging.warning("Failed to scrape Yahoo day gainers: %s", e)
-                
-            # Fallback if scraping fails - keep it dynamic by adding some hot tickers
-            async with self.stock_symbols_lock:
-                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META", "COIN", "MARA", "RIOT", "MSTR"]
-                self.stock_symbols = [SymbolStat(s, 0, 0, 0) for s in fallback]
-                logging.info("Using fallback stock list: %s", fallback)
+            logging.warning("Trending API returned no results or failed [%s], falling back to scraping...", resp.status)
+            
+            # Fallback to HTML scraping if API fails
+            scrape_url = "https://finance.yahoo.com/markets/stocks/gainers/"
+            async with self.http_session.get(scrape_url, headers=headers) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    dfs = pd.read_html(html)
+                    if dfs:
+                        df = dfs[0]
+                        df.columns = [str(c).strip() for c in df.columns]
+                        stats = []
+                        sym_col = next((c for c in df.columns if 'Symbol' in c or 'Ticker' in c), df.columns[0])
+                        pct_col = next((c for c in df.columns if '%' in c or 'Change' in c), None)
+                        price_col = next((c for c in df.columns if 'Price' in c), None)
+
+                        for _, row in df.iterrows():
+                            try:
+                                symbol = str(row[sym_col]).split()[0]
+                                pct_val = str(row[pct_col]).replace('%', '').replace('+', '').replace(',', '') if pct_col else "0"
+                                price = float(str(row[price_col]).replace(',', '')) if price_col else 0.0
+                                stats.append(SymbolStat(symbol=symbol, gain_pct=float(pct_val), last_price=price, quote_volume=0.0))
+                            except: continue
+                        
+                        if stats:
+                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
+                            async with self.stock_symbols_lock:
+                                self.stock_symbols = stats[:TOP_N]
+                            logging.info("Top stocks refreshed via scraping fallback: %s symbols", len(self.stock_symbols))
+                            return
+
         except Exception as exc:
             logging.error("refresh_top_stocks error: %s", exc)
+            
+        # Last resort fallback
+        async with self.stock_symbols_lock:
+            if not self.stock_symbols:
+                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META", "COIN", "MARA", "RIOT", "MSTR"]
+                self.stock_symbols = [SymbolStat(s, 0, 0, 0) for s in fallback]
+                logging.info("Using hardcoded fallback stock list")
 
     def _get_mexc_link(self, symbol: str) -> str:
         # Converts symbol like BTC/USDT:USDT to BTC_USDT for MEXC
@@ -389,7 +412,7 @@ class TopGainersBot:
     def _get_yahoo_link(self, symbol: str) -> str:
         return f"https://finance.yahoo.com/quote/{symbol}"
 
-    def _create_chart(self, symbol: str, closes: List[float], upper_band: float, lower_band: float, mean_band: float, is_stock: bool = False) -> io.BytesIO:
+    def _create_chart(self, symbol: str, closes: List[float], upper_band: float, lower_band: float, mean_band: float, timeframe: str = "") -> io.BytesIO:
         plt.figure(figsize=(10, 6))
         plt.plot(closes, label='Price', color='blue', linewidth=1.5)
         
@@ -399,8 +422,7 @@ class TopGainersBot:
         plt.plot(x, [mean_band] * len(closes), label='Middle Band', color='orange', linestyle=':', alpha=0.5)
         plt.plot(x, [lower_band] * len(closes), label='Lower Band', color='green', linestyle='--', alpha=0.7)
         
-        title_suffix = f"({STOCK_TIMEFRAME})" if is_stock else f"({TIMEFRAMES[0]})"
-        plt.title(f"{symbol} - Bollinger Bands {title_suffix}")
+        plt.title(f"{symbol} - Bollinger Bands ({timeframe or TIMEFRAMES[0]})")
         plt.xlabel("Candles (Last 50)")
         plt.ylabel("Price")
         plt.legend()
@@ -490,7 +512,8 @@ class TopGainersBot:
                     await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
                     
                     if last_tf_bands:
-                        chart_buf = self._create_chart(symbol_stat.symbol, *last_tf_bands)
+                        closes_list, l, m, u = last_tf_bands
+                        chart_buf = self._create_chart(symbol_stat.symbol, closes_list[-50:], u, l, m, timeframe=TIMEFRAMES[0])
                         await self.send_telegram_photo(chart_buf, msg)
                     else:
                         await self.send_telegram(msg)
@@ -588,7 +611,7 @@ class TopGainersBot:
                         closes_list = hist_last['Close'].tolist()
                         l, m, u = bollinger_bands(closes_list)
                         
-                        chart_buf = self._create_chart(symbol_stat.symbol, closes_list[-50:], u, l, m, is_stock=True)
+                        chart_buf = self._create_chart(symbol_stat.symbol, closes_list[-50:], u, l, m, timeframe=STOCK_TIMEFRAMES[-1])
                         await self.send_telegram_photo(chart_buf, msg)
                         
                         logging.info("Stock Signal: %s | multi-tf confirmed", symbol_stat.symbol)
