@@ -195,10 +195,12 @@ class TopGainersBot:
         return True
 
     async def start(self) -> None:
-        # Increase max_field_size for Yahoo Finance headers
+        # Increase max_field_size for Yahoo Finance headers. 
+        # Large cookies/headers from Yahoo can exceed the default 8KB.
+        # Set to 64KB (65536) to be safe as seen in error logs (29899 bytes).
         self.http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
-            max_field_size=16384
+            max_field_size=65536
         )
         await self.db.setup()
         await self.exchange.load_markets()
