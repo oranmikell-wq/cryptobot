@@ -20,6 +20,7 @@ matplotlib.use('Agg') # Use non-interactive backend for server-side chart genera
 
 
 TOP_N = 5
+MIN_GAIN_PCT = 40.0
 TIMEFRAME = "5m"
 CANDLE_LIMIT = 50
 TOP_REFRESH_SECONDS = 5 * 60
@@ -226,15 +227,14 @@ class TopGainersBot:
         startup_msg = (
             "🤖 <b>Bot Started Successfully!</b>\n\n"
             "🔍 <b>Scanning Profile:</b>\n"
-            f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers ({MARKET_TYPE})\n"
+            f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers with >{MIN_GAIN_PCT}% daily gain\n"
             f"• Stocks (Yahoo): {stocks_status}\n"
             f"• Commodities (MEXC Futures): {commodities_status}\n\n"
             "⏱️ <b>Intervals:</b>\n"
             f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
             f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
-            f"• Crypto Timeframes: {', '.join(TIMEFRAMES)}\n"
-            f"• Stock Timeframes: {', '.join(STOCK_TIMEFRAMES)}\n"
-            f"• Commodity Timeframes: {', '.join(TIMEFRAMES)}\n\n"
+            f"• Timeframes (Crypto/Commodities): {', '.join(TIMEFRAMES)}\n"
+            f"• Timeframes (Stocks): {', '.join(STOCK_TIMEFRAMES)}\n\n"
             "📊 <b>Active Indicators:</b>\n"
             "• Bollinger Bands: ✅ Active\n"
             f"• RSI: {rsi_status}\n\n"
@@ -311,6 +311,9 @@ class TopGainersBot:
                 continue
 
             gain_pct = float(t["percentage"])
+            if gain_pct < MIN_GAIN_PCT:
+                continue
+
             last_price = float(t["last"])
             quote_volume = float(t.get("quoteVolume") or 0.0)
 
