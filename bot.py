@@ -19,10 +19,10 @@ import pandas as pd
 matplotlib.use('Agg') # Use non-interactive backend for server-side chart generation
 
 
-TOP_N = 250
+TOP_N = 5
 TIMEFRAME = "5m"
 CANDLE_LIMIT = 50
-TOP_REFRESH_SECONDS = 15 * 60
+TOP_REFRESH_SECONDS = 5 * 60
 CHECK_INTERVAL_SECONDS = 120  # Spaced out even more
 BB_PERIOD = 20
 BB_STD_DEV = 2

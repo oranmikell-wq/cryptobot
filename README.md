@@ -1,14 +1,14 @@
-# Top 250 Gainers Short Alert Bot (MEXC default)
+# Top 5 Gainers Short Alert Bot (MEXC default)
 
 Async Python bot for crypto spot markets (MEXC by default) that:
 - scans all `/USDT` pairs by 24h percentage change,
-- keeps the top 250 gainers list refreshed every 15 minutes,
+- keeps the top 5 gainers list refreshed every 5 minutes,
 - checks Bollinger + RSI signal every minute on 5m candles,
 - sends Telegram alerts for SHORT conditions.
 
 ## Strategy
 
-For each symbol in top 250:
+For each symbol in top 5:
 - Fetch last 50 candles on `5m` timeframe.
 - Calculate Bollinger Bands `(20, 2)`.
 - Calculate RSI `(14)`.
