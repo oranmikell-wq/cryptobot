@@ -224,7 +224,7 @@ class TopGainersBot:
             "🔍 <b>Scanning Profile:</b>\n"
             f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers ({MARKET_TYPE})\n"
             f"• Stocks (Yahoo): {stocks_status}\n"
-            f"• Commodities (Yahoo): {commodities_status}\n\n"
+            f"• Commodities (MEXC Futures): {commodities_status}\n\n"
             "⏱️ <b>Intervals:</b>\n"
             f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
             f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
