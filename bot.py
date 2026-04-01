@@ -41,6 +41,11 @@ STOCK_TIMEFRAMES = [tf.strip() for tf in _raw_stock_tf.split(",") if tf.strip()]
 if not STOCK_TIMEFRAMES:
     STOCK_TIMEFRAMES = ["5m"]
 
+ENABLE_COMMODITIES = os.getenv("ENABLE_COMMODITIES", "no").strip().lower() == "yes"
+# Use MEXC Futures symbols for commodities
+_default_commodities = "SILVER/USDT:USDT,USOIL/USDT:USDT,UKOIL/USDT:USDT,NGAS/USDT:USDT,COPPER/USDT:USDT"
+COMMODITY_SYMBOLS = [s.strip() for s in os.getenv("COMMODITY_SYMBOLS", _default_commodities).split(",") if s.strip()]
+
 
 @dataclass
 class SymbolStat:
@@ -163,8 +168,10 @@ class TopGainersBot:
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.top_symbols: List[SymbolStat] = []
         self.stock_symbols: List[SymbolStat] = []
+        self.commodity_symbols: List[SymbolStat] = [] # For commodities
         self.top_symbols_lock = asyncio.Lock()
         self.stock_symbols_lock = asyncio.Lock()
+        self.commodity_symbols_lock = asyncio.Lock() # For commodities
         self.stock_api_lock = asyncio.Lock()  # Added lock specifically for sequential stock API calls
         self.stop_event = asyncio.Event()
         self.is_scanning = True  # Added flag to control scanning activity
@@ -209,13 +216,15 @@ class TopGainersBot:
         
         # Build comprehensive startup message
         stocks_status = f"✅ Active ({', '.join(STOCK_TIMEFRAMES)})" if ENABLE_STOCKS else "❌ Disabled"
+        commodities_status = f"✅ Active ({len(COMMODITY_SYMBOLS)} symbols)" if ENABLE_COMMODITIES else "❌ Disabled"
         rsi_status = "✅ Active" if USE_RSI else "❌ Disabled"
         
         startup_msg = (
             "🤖 <b>Bot Started Successfully!</b>\n\n"
             "🔍 <b>Scanning Profile:</b>\n"
             f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers ({MARKET_TYPE})\n"
-            f"• Stocks (Yahoo): {stocks_status}\n\n"
+            f"• Stocks (Yahoo): {stocks_status}\n"
+            f"• Commodities (Yahoo): {commodities_status}\n\n"
             "⏱️ <b>Intervals:</b>\n"
             f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
             f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
@@ -253,6 +262,10 @@ class TopGainersBot:
             logging.info("Stocks scanning enabled.")
             tasks.append(self._stock_symbols_scheduler())
             tasks.append(self._stock_signal_scheduler())
+
+        if ENABLE_COMMODITIES:
+            logging.info("Commodities scanning enabled.")
+            tasks.append(self._commodity_signal_scheduler())
             
         await asyncio.gather(*tasks)
 
@@ -525,7 +538,7 @@ class TopGainersBot:
     async def evaluate_stock(self, symbol_stat: SymbolStat) -> None:
         """Evaluate a single stock for BB/RSI signals on multiple timeframes."""
         async with self.semaphore:
-            # We use a separate lock for the API to ensure stock requests are strictly sequential
+            # We use a lock for the API to ensure stock requests are strictly sequential
             # This is crucial for Yahoo Finance to avoid rate limiting
             async with self.stock_api_lock:
                 try:
@@ -617,6 +630,89 @@ class TopGainersBot:
                         logging.info("Stock Signal: %s | multi-tf confirmed", symbol_stat.symbol)
                 except Exception as exc:
                     logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
+
+    async def evaluate_commodity(self, symbol: str) -> None:
+        """Evaluate a single commodity for BB/RSI signals on multiple timeframes using MEXC."""
+        async with self.semaphore:
+            try:
+                # Check if the market exists in MEXC
+                market = self.exchange.markets.get(symbol)
+                if not market:
+                    logging.warning("Commodity symbol %s not found in MEXC markets.", symbol)
+                    return
+
+                all_timeframes_match = True
+                tf_metrics = []
+                alert_key_parts = []
+                last_tf_bands = None
+                
+                # Use TIMEFRAMES (crypto timeframes) since we are using MEXC
+                for timeframe in TIMEFRAMES:
+                    await asyncio.sleep(0.5) # Rate limiting
+                    
+                    closes, last_candle_ts = await self._get_closes_for_timeframe(symbol, timeframe, CANDLE_LIMIT)
+                    
+                    if len(closes) < BB_PERIOD + 2:
+                        all_timeframes_match = False
+                        break
+
+                    current_price = closes[-1]
+                    
+                    lower_band, mean_band, upper_band = bollinger_bands(closes)
+                    
+                    bb_match = current_price > upper_band
+                    
+                    rsi_match = True
+                    current_rsi = None
+                    if USE_RSI:
+                        current_rsi = calculate_rsi(closes)
+                        rsi_match = current_rsi > RSI_OVERBOUGHT
+                    
+                    if bb_match and rsi_match:
+                        tf_metrics.append((timeframe, current_price, upper_band, current_rsi))
+                        alert_key_parts.append(f"{timeframe}_{last_candle_ts}")
+                        if last_tf_bands is None:
+                            last_tf_bands = (closes, lower_band, mean_band, upper_band)
+                    else:
+                        all_timeframes_match = False
+                        break
+
+                if all_timeframes_match and tf_metrics:
+                    alert_key = f"commodity_{'_'.join(alert_key_parts)}"
+                    if await self.db.is_alert_sent(symbol, alert_key):
+                        return
+
+                    logging.info("!!! COMMODITY SIGNAL DETECTED (Multi-TF): %s !!!", symbol)
+                    
+                    exchange_link = self._get_mexc_link(symbol)
+                    
+                    metrics_lines = []
+                    for tf, price, upper, rsi in tf_metrics:
+                        rsi_text = f", RSI={rsi:.1f}" if rsi is not None else ""
+                        metrics_lines.append(f"• {tf}: Price={price:.4f}, Upper={upper:.4f}{rsi_text}")
+                    
+                    metrics_text = "\n".join(metrics_lines)
+                    msg = (
+                        "📉 <b>COMMODITY SHORT signal detected (Multi-TF Confirmation)</b>\n"
+                        f"Symbol: <b>{symbol}</b>\n"
+                        f"Type: <i>Commodity (MEXC Futures)</i>\n"
+                        f"Confirmed on: {', '.join(TIMEFRAMES)}\n"
+                        f"{metrics_text}\n\n"
+                        f"🔗 <a href='{exchange_link}'>Trade on MEXC</a>"
+                    )
+                    
+                    await self.db.save_alert(symbol, alert_key, message_text=msg)
+                    
+                    if last_tf_bands:
+                        closes_list, l, m, u = last_tf_bands
+                        chart_buf = self._create_chart(symbol, closes_list[-50:], u, l, m, timeframe=TIMEFRAMES[0])
+                        await self.send_telegram_photo(chart_buf, msg)
+                    else:
+                        await self.send_telegram(msg)
+                    
+                    logging.info("Commodity Signal: %s | multi-tf confirmed", symbol)
+            except Exception as exc:
+                logging.warning("Failed commodity %s: %s", symbol, exc)
 
     async def _get_closes_for_timeframe(self, symbol: str, timeframe: str, limit: int) -> Tuple[List[float], int]:
         if timeframe in self.exchange_supported_timeframes:
@@ -738,6 +834,25 @@ class TopGainersBot:
             except asyncio.TimeoutError:
                 pass
 
+    async def _commodity_signal_scheduler(self) -> None:
+        """Periodically check for signals on the predefined list of commodities."""
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                if self.is_scanning and COMMODITY_SYMBOLS:
+                    logging.info("Checking %s commodities...", len(COMMODITY_SYMBOLS))
+                    await asyncio.gather(*(self.evaluate_commodity(s) for s in COMMODITY_SYMBOLS))
+            except Exception as exc:
+                logging.exception("Commodity signal check failed: %s", exc)
+
+            elapsed = time.monotonic() - started
+            # Use the same interval as stocks for consistency
+            wait_for = max(1, int(CHECK_INTERVAL_SECONDS - elapsed))
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
+            except asyncio.TimeoutError:
+                pass
+
     async def _stock_signal_scheduler(self) -> None:
         while not self.stop_event.is_set():
             started = time.monotonic()
@@ -846,7 +961,7 @@ class TopGainersBot:
                                         "🛑 /stop - Pause scanning\n"
                                         "📍 /last - Show last signal details\n"
                                         "❓ /help - Show this menu\n\n"
-                                        f"<i>Scanning {TOP_N} symbols on {len(TIMEFRAMES)} crypto timeframes and {', '.join(STOCK_TIMEFRAMES)} for stocks.</i>"
+                                        f"<i>Scanning crypto, stocks, and commodities.</i>"
                                     )
                                     payload = {"chat_id": chat_id, "text": help_text, "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
