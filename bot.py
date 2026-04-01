@@ -43,7 +43,7 @@ if not STOCK_TIMEFRAMES:
 
 ENABLE_COMMODITIES = os.getenv("ENABLE_COMMODITIES", "no").strip().lower() == "yes"
 # Use MEXC Futures symbols for commodities
-_default_commodities = "SILVER/USDT:USDT,USOIL/USDT:USDT,UKOIL/USDT:USDT,NGAS/USDT:USDT,COPPER/USDT:USDT"
+_default_commodities = "XAUT/USDT:USDT,SILVER/USDT:USDT,USOIL/USDT:USDT,UKOIL/USDT:USDT,NGAS/USDT:USDT,COPPER/USDT:USDT"
 COMMODITY_SYMBOLS = [s.strip() for s in os.getenv("COMMODITY_SYMBOLS", _default_commodities).split(",") if s.strip()]
 
 
@@ -216,7 +216,11 @@ class TopGainersBot:
         
         # Build comprehensive startup message
         stocks_status = f"✅ Active ({', '.join(STOCK_TIMEFRAMES)})" if ENABLE_STOCKS else "❌ Disabled"
-        commodities_status = f"✅ Active ({len(COMMODITY_SYMBOLS)} symbols)" if ENABLE_COMMODITIES else "❌ Disabled"
+        
+        # Format commodity symbols for display (extracting the base name like GOLD, SILVER)
+        comm_names = [s.split('/')[0].replace('(XAUT)', '').replace('(PAXG)', '') for s in COMMODITY_SYMBOLS]
+        commodities_status = f"✅ Active ({len(COMMODITY_SYMBOLS)} symbols: {', '.join(comm_names)})" if ENABLE_COMMODITIES else "❌ Disabled"
+        
         rsi_status = "✅ Active" if USE_RSI else "❌ Disabled"
         
         startup_msg = (
@@ -229,7 +233,8 @@ class TopGainersBot:
             f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
             f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
             f"• Crypto Timeframes: {', '.join(TIMEFRAMES)}\n"
-            f"• Stock Timeframes: {', '.join(STOCK_TIMEFRAMES)}\n\n"
+            f"• Stock Timeframes: {', '.join(STOCK_TIMEFRAMES)}\n"
+            f"• Commodity Timeframes: {', '.join(TIMEFRAMES)}\n\n"
             "📊 <b>Active Indicators:</b>\n"
             "• Bollinger Bands: ✅ Active\n"
             f"• RSI: {rsi_status}\n\n"
