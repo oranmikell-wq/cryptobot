@@ -1,7 +1,7 @@
 # Top 5 Gainers Short Alert Bot (MEXC default)
 
 Async Python bot for crypto spot markets (MEXC by default) that:
-- scans all `/USDT` pairs by 24h percentage change,
+- scans all `/USDT` pairs by 24h percentage change (minimum 40% gain),
 - keeps the top 5 gainers list refreshed every 5 minutes,
 - checks Bollinger + RSI signal every minute on 5m candles,
 - sends Telegram alerts for SHORT conditions.
@@ -34,7 +34,7 @@ Set environment variables:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `MARKET_TYPE` (optional: `futures` or `spot`, default: `futures`)
-- `TIMEFRAMES` (optional, comma-separated, default: `5m`)
+- `TIMEFRAMES` (optional, comma-separated, default: `5m,15m,1h,4h,1d`)
 
 PowerShell example:
 

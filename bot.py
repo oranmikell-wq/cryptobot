@@ -23,6 +23,7 @@ TOP_N = 5
 MIN_GAIN_PCT = 40.0
 TIMEFRAME = "5m"
 CANDLE_LIMIT = 50
+DEFAULT_TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"]
 TOP_REFRESH_SECONDS = 5 * 60
 CHECK_INTERVAL_SECONDS = 120  # Spaced out even more
 BB_PERIOD = 20
@@ -31,7 +32,9 @@ RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 PARALLEL_SYMBOL_WORKERS = 3  # Reduced further to be safe
 MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "0"))
-TIMEFRAMES = [tf.strip() for tf in os.getenv("TIMEFRAMES", TIMEFRAME).split(",") if tf.strip()]
+TIMEFRAMES = [tf.strip() for tf in os.getenv("TIMEFRAMES", "").split(",") if tf.strip()]
+if not TIMEFRAMES:
+    TIMEFRAMES = DEFAULT_TIMEFRAMES
 MARKET_TYPE = (os.getenv("MARKET_TYPE", "futures").strip().lower() or "futures")
 MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
 BASE_RETRY_DELAY_SECONDS = float(os.getenv("BASE_RETRY_DELAY_SECONDS", "1.5"))  # Increased from 1.0
@@ -330,7 +333,12 @@ class TopGainersBot:
         top = stats[:TOP_N]
         async with self.top_symbols_lock:
             self.top_symbols = top
-        logging.info("Top list refreshed: %s symbols", len(top))
+        
+        # Enhanced logging to help user see what is being watched
+        top_symbols_str = ", ".join([f"{s.symbol} ({s.gain_pct:.1f}%)" for s in top])
+        logging.info("Top list refreshed: %s symbols [%s]", len(top), top_symbols_str)
+        if not top:
+            logging.info("NO symbols currently meet the >%.1f%% gain threshold.", MIN_GAIN_PCT)
 
     async def refresh_top_stocks(self) -> None:
         """Fetch US stock day gainers/trending from Yahoo Finance API."""
@@ -495,9 +503,9 @@ class TopGainersBot:
 
                     tf_metrics.append((timeframe, current_price, upper_band, current_rsi, tf_match))
                     if not tf_match:
-                        # Optional: Log if it matched some timeframes but not all
-                        if len(tf_metrics) >= 3:
-                            logging.debug("Symbol %s matched %d/%d TFs (failed at %s)", 
+                        # Log partial matches to help user understand the strictness
+                        if len(tf_metrics) > 1:
+                            logging.info("Symbol %s matched %d/%d timeframes (stopped at %s)", 
                                          symbol_stat.symbol, len(tf_metrics)-1, len(TIMEFRAMES), timeframe)
                         all_timeframes_match = False
                         break
@@ -884,6 +892,92 @@ class TopGainersBot:
             except asyncio.TimeoutError:
                 pass
 
+    async def manual_check_symbol(self, raw_symbol: str, chat_id: str) -> None:
+        """Manually checks a single symbol and sends detailed report to user."""
+        symbol = raw_symbol.upper().strip()
+        if "/" not in symbol:
+            if MARKET_TYPE == "futures":
+                symbol = f"{symbol}/USDT:USDT"
+            else:
+                symbol = f"{symbol}/USDT"
+        
+        url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        
+        try:
+            # Check if market exists
+            market = self.exchange.markets.get(symbol)
+            if not market:
+                # Try one more variation for futures if not found
+                if MARKET_TYPE == "futures" and ":USDT" not in symbol:
+                    symbol = f"{symbol}:USDT"
+                    market = self.exchange.markets.get(symbol)
+                
+                if not market:
+                    await self.http_session.post(url_send, json={
+                        "chat_id": chat_id, 
+                        "text": f"❌ Symbol <b>{symbol}</b> not found on {self.exchange_id.upper()}.",
+                        "parse_mode": "HTML"
+                    })
+                    return
+
+            await self.http_session.post(url_send, json={
+                "chat_id": chat_id, 
+                "text": f"🔍 Checking <b>{symbol}</b> on {', '.join(TIMEFRAMES)}...",
+                "parse_mode": "HTML"
+            })
+
+            ticker = await self.exchange.fetch_ticker(symbol)
+            gain_pct = float(ticker.get("percentage") or 0.0)
+            price = float(ticker.get("last") or 0.0)
+            
+            tf_results = []
+            all_match = True
+            
+            for tf in TIMEFRAMES:
+                closes, _ = await self._get_closes_for_timeframe(symbol, tf, CANDLE_LIMIT)
+                if len(closes) < BB_PERIOD + 2:
+                    tf_results.append(f"• {tf}: Not enough data")
+                    all_match = False
+                    continue
+                
+                lower, mean, upper = bollinger_bands(closes)
+                current_rsi = calculate_rsi(closes) if USE_RSI else None
+                
+                bb_match = closes[-1] > upper
+                rsi_match = (current_rsi > RSI_OVERBOUGHT) if USE_RSI else True
+                match = bb_match and rsi_match
+                
+                status_emoji = "✅" if match else "❌"
+                res_line = f"{status_emoji} <b>{tf}</b>: Price {closes[-1]:.6f} | Upper {upper:.6f}"
+                if USE_RSI:
+                    res_line += f" | RSI {current_rsi:.1f}"
+                tf_results.append(res_line)
+                
+                if not match:
+                    all_match = False
+
+            final_status = "🚀 <b>SIGNAL MATCHED!</b>" if all_match else "⚠️ <b>No Signal</b>"
+            report = (
+                f"{final_status}\n\n"
+                f"Symbol: <b>{symbol}</b>\n"
+                f"Price: <b>{price:.6f}</b>\n"
+                f"24h Gain: <b>{gain_pct:.2f}%</b>\n\n"
+                "<b>Timeframe Details:</b>\n" + "\n".join(tf_results)
+            )
+            
+            await self.http_session.post(url_send, json={
+                "chat_id": chat_id, 
+                "text": report,
+                "parse_mode": "HTML"
+            })
+
+        except Exception as e:
+            logging.error("Manual check error: %s", e)
+            await self.http_session.post(url_send, json={
+                "chat_id": chat_id, 
+                "text": f"❌ Error checking {symbol}: {str(e)}"
+            })
+
     async def _update_listener(self) -> None:
         """Listens for incoming messages to help user find Chat IDs."""
         # Wait a bit for other instances to shut down
@@ -961,12 +1055,25 @@ class TopGainersBot:
                                     payload = {"chat_id": chat_id, "text": "🛑 <b>Scanning Paused!</b> The bot will stop sending alerts.", "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
                                     logging.info("Scanning paused via Telegram command.")
+                                elif text.startswith("/check"):
+                                    parts = text.split()
+                                    if len(parts) > 1:
+                                        symbol_to_check = parts[1]
+                                        asyncio.create_task(self.manual_check_symbol(symbol_to_check, chat_id))
+                                    else:
+                                        url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+                                        await self.http_session.post(url_send, json={
+                                            "chat_id": chat_id, 
+                                            "text": "⚠️ Please provide a symbol. Example: <code>/check btc</code>",
+                                            "parse_mode": "HTML"
+                                        })
                                 elif text == "/help" or text == "/menu":
                                     url_send = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
                                     help_text = (
                                         "🤖 <b>Bot Menu:</b>\n\n"
                                         "▶️ /start - Resume scanning\n"
                                         "🛑 /stop - Pause scanning\n"
+                                        "🔍 /check &lt;symbol&gt; - Manual signal check\n"
                                         "📍 /last - Show last signal details\n"
                                         "❓ /help - Show this menu\n\n"
                                         f"<i>Scanning crypto, stocks, and commodities.</i>"
