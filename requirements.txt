@@ -2,6 +2,3 @@ aiohttp
 aiosqlite
 ccxt
 matplotlib
-yfinance
-pandas
-lxml

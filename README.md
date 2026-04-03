@@ -1,6 +1,6 @@
 # Top 5 Gainers Short Alert Bot (MEXC default)
 
-Async Python bot for crypto spot markets (MEXC by default) that:
+Async Python bot for crypto and commodities (MEXC by default) that:
 - scans all `/USDT` pairs by 24h percentage change (minimum 40% gain),
 - keeps the top 5 gainers list refreshed every 5 minutes,
 - checks Bollinger + RSI signal every minute on 5m candles,

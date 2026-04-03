@@ -14,8 +14,6 @@ import aiosqlite
 import ccxt.async_support as ccxt
 import matplotlib.pyplot as plt
 import matplotlib
-import yfinance as yf
-import pandas as pd
 matplotlib.use('Agg') # Use non-interactive backend for server-side chart generation
 
 
@@ -39,11 +37,6 @@ MARKET_TYPE = (os.getenv("MARKET_TYPE", "futures").strip().lower() or "futures")
 MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
 BASE_RETRY_DELAY_SECONDS = float(os.getenv("BASE_RETRY_DELAY_SECONDS", "1.5"))  # Increased from 1.0
 USE_RSI = os.getenv("USE_RSI", "no").strip().lower() == "yes"
-ENABLE_STOCKS = os.getenv("ENABLE_STOCKS", "no").strip().lower() == "yes"
-_raw_stock_tf = os.getenv("STOCK_TIMEFRAME", "5m").strip()
-STOCK_TIMEFRAMES = [tf.strip() for tf in _raw_stock_tf.split(",") if tf.strip()]
-if not STOCK_TIMEFRAMES:
-    STOCK_TIMEFRAMES = ["5m"]
 
 ENABLE_COMMODITIES = os.getenv("ENABLE_COMMODITIES", "no").strip().lower() == "yes"
 # Use MEXC Futures symbols for commodities
@@ -171,12 +164,9 @@ class TopGainersBot:
             self.exchange = exchange_cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.top_symbols: List[SymbolStat] = []
-        self.stock_symbols: List[SymbolStat] = []
         self.commodity_symbols: List[SymbolStat] = [] # For commodities
         self.top_symbols_lock = asyncio.Lock()
-        self.stock_symbols_lock = asyncio.Lock()
         self.commodity_symbols_lock = asyncio.Lock() # For commodities
-        self.stock_api_lock = asyncio.Lock()  # Added lock specifically for sequential stock API calls
         self.stop_event = asyncio.Event()
         self.is_scanning = True  # Added flag to control scanning activity
         self.semaphore = asyncio.Semaphore(PARALLEL_SYMBOL_WORKERS)
@@ -219,8 +209,6 @@ class TopGainersBot:
         await self.refresh_top_symbols()
         
         # Build comprehensive startup message
-        stocks_status = f"✅ Active ({', '.join(STOCK_TIMEFRAMES)})" if ENABLE_STOCKS else "❌ Disabled"
-        
         # Format commodity symbols for display (extracting the base name like GOLD, SILVER)
         comm_names = [s.split('/')[0].replace('(XAUT)', '').replace('(PAXG)', '') for s in COMMODITY_SYMBOLS]
         commodities_status = f"✅ Active ({len(COMMODITY_SYMBOLS)} symbols: {', '.join(comm_names)})" if ENABLE_COMMODITIES else "❌ Disabled"
@@ -231,13 +219,11 @@ class TopGainersBot:
             "🤖 <b>Bot Started Successfully!</b>\n\n"
             "🔍 <b>Scanning Profile:</b>\n"
             f"• Crypto ({self.exchange_id.upper()}): Top {TOP_N} gainers with >{MIN_GAIN_PCT}% daily gain\n"
-            f"• Stocks (Yahoo): {stocks_status}\n"
             f"• Commodities (MEXC Futures): {commodities_status}\n\n"
             "⏱️ <b>Intervals:</b>\n"
             f"• Refresh Top List: Every {TOP_REFRESH_SECONDS // 60} min\n"
             f"• Signal Check: Every {CHECK_INTERVAL_SECONDS // 60} min\n"
-            f"• Timeframes (Crypto/Commodities): {', '.join(TIMEFRAMES)}\n"
-            f"• Timeframes (Stocks): {', '.join(STOCK_TIMEFRAMES)}\n\n"
+            f"• Timeframes (Crypto/Commodities): {', '.join(TIMEFRAMES)}\n\n"
             "📊 <b>Active Indicators:</b>\n"
             "• Bollinger Bands: ✅ Active\n"
             f"• RSI: {rsi_status}\n\n"
@@ -266,11 +252,6 @@ class TopGainersBot:
         else:
             logging.info("Telegram Listener is disabled via environment variable.")
         
-        if ENABLE_STOCKS:
-            logging.info("Stocks scanning enabled.")
-            tasks.append(self._stock_symbols_scheduler())
-            tasks.append(self._stock_signal_scheduler())
-
         if ENABLE_COMMODITIES:
             logging.info("Commodities scanning enabled.")
             tasks.append(self._commodity_signal_scheduler())
@@ -340,94 +321,6 @@ class TopGainersBot:
         if not top:
             logging.info("NO symbols currently meet the >%.1f%% gain threshold.", MIN_GAIN_PCT)
 
-    async def refresh_top_stocks(self) -> None:
-        """Fetch US stock day gainers/trending from Yahoo Finance API."""
-        logging.info("Refreshing top stocks list via Trending API...")
-        try:
-            # Use the robust query1 trending endpoint provided in the context
-            url = "https://query1.finance.yahoo.com/v1/finance/trending/US?count=25&fields=symbol,regularMarketChangePercent,regularMarketPrice,quoteType"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-            }
-            
-            async with self.http_session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("finance", {}).get("result", [])
-                    if results:
-                        quotes = results[0].get("quotes", [])
-                        stats = []
-                        for q in quotes:
-                            # Filter for EQUITY to avoid overlap with crypto (handled by MEXC)
-                            if q.get("quoteType") != "EQUITY":
-                                continue
-                                
-                            symbol = q.get("symbol")
-                            # Extract percentage change from nested structure
-                            pct_data = q.get("regularMarketChangePercent") or {}
-                            pct_change = float(pct_data.get("raw", 0.0))
-                            
-                            # Extract price
-                            price_data = q.get("regularMarketPrice") or {}
-                            price = float(price_data.get("raw", 0.0))
-                            
-                            if symbol:
-                                stats.append(SymbolStat(
-                                    symbol=symbol,
-                                    gain_pct=pct_change,
-                                    last_price=price,
-                                    quote_volume=0.0 # Trending API doesn't always provide volume in simple format
-                                ))
-                        
-                        if stats:
-                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
-                            async with self.stock_symbols_lock:
-                                self.stock_symbols = stats
-                            logging.info("Top stocks refreshed via API: %s symbols", len(self.stock_symbols))
-                            return
-
-            logging.warning("Trending API returned no results or failed [%s], falling back to scraping...", resp.status)
-            
-            # Fallback to HTML scraping if API fails
-            scrape_url = "https://finance.yahoo.com/markets/stocks/gainers/"
-            async with self.http_session.get(scrape_url, headers=headers) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    dfs = pd.read_html(html)
-                    if dfs:
-                        df = dfs[0]
-                        df.columns = [str(c).strip() for c in df.columns]
-                        stats = []
-                        sym_col = next((c for c in df.columns if 'Symbol' in c or 'Ticker' in c), df.columns[0])
-                        pct_col = next((c for c in df.columns if '%' in c or 'Change' in c), None)
-                        price_col = next((c for c in df.columns if 'Price' in c), None)
-
-                        for _, row in df.iterrows():
-                            try:
-                                symbol = str(row[sym_col]).split()[0]
-                                pct_val = str(row[pct_col]).replace('%', '').replace('+', '').replace(',', '') if pct_col else "0"
-                                price = float(str(row[price_col]).replace(',', '')) if price_col else 0.0
-                                stats.append(SymbolStat(symbol=symbol, gain_pct=float(pct_val), last_price=price, quote_volume=0.0))
-                            except: continue
-                        
-                        if stats:
-                            stats.sort(key=lambda x: x.gain_pct, reverse=True)
-                            async with self.stock_symbols_lock:
-                                self.stock_symbols = stats[:TOP_N]
-                            logging.info("Top stocks refreshed via scraping fallback: %s symbols", len(self.stock_symbols))
-                            return
-
-        except Exception as exc:
-            logging.error("refresh_top_stocks error: %s", exc)
-            
-        # Last resort fallback
-        async with self.stock_symbols_lock:
-            if not self.stock_symbols:
-                fallback = ["NVDA", "TSLA", "AAPL", "AMD", "MSFT", "AMZN", "GOOGL", "META", "COIN", "MARA", "RIOT", "MSTR"]
-                self.stock_symbols = [SymbolStat(s, 0, 0, 0) for s in fallback]
-                logging.info("Using hardcoded fallback stock list")
-
     def _get_mexc_link(self, symbol: str) -> str:
         # Converts symbol like BTC/USDT:USDT to BTC_USDT for MEXC
         # For spot: https://www.mexc.com/exchange/BTC_USDT
@@ -437,9 +330,6 @@ class TopGainersBot:
             return f"https://www.mexc.com/futures/{clean_symbol}"
         else:
             return f"https://www.mexc.com/exchange/{clean_symbol}"
-
-    def _get_yahoo_link(self, symbol: str) -> str:
-        return f"https://finance.yahoo.com/quote/{symbol}"
 
     def _create_chart(self, symbol: str, closes: List[float], upper_band: float, lower_band: float, mean_band: float, timeframe: str = "") -> io.BytesIO:
         plt.figure(figsize=(10, 6))
@@ -550,102 +440,6 @@ class TopGainersBot:
                     logging.info("Signal(all TF): %s | gain=%0.2f", symbol_stat.symbol, symbol_stat.gain_pct)
             except Exception as exc:
                 logging.warning("Failed symbol %s: %s", symbol_stat.symbol, exc)
-
-    async def evaluate_stock(self, symbol_stat: SymbolStat) -> None:
-        """Evaluate a single stock for BB/RSI signals on multiple timeframes."""
-        async with self.semaphore:
-            # We use a lock for the API to ensure stock requests are strictly sequential
-            # This is crucial for Yahoo Finance to avoid rate limiting
-            async with self.stock_api_lock:
-                try:
-                    # Slow down requests to avoid Yahoo Finance rate limits
-                    # 5.0 seconds with jitter is safer for Render data center IPs
-                    await asyncio.sleep(5.0 + random.uniform(0, 2.0))
-                    
-                    # Redirect yfinance cache to /tmp to avoid permission/conflict errors in Render
-                    try:
-                        yf.set_tz_cache_location("/tmp/py-yfinance")
-                    except:
-                        pass
-                        
-                    # yfinance is synchronous, so we run it in a thread to not block the event loop
-                    loop = asyncio.get_running_loop()
-                    ticker = yf.Ticker(symbol_stat.symbol)
-                    
-                    all_timeframes_match = True
-                    tf_metrics = []
-                    alert_key_parts = []
-                    
-                    for timeframe in STOCK_TIMEFRAMES:
-                        # Fetch history for each timeframe
-                        hist = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=timeframe))
-                        
-                        if hist.empty or len(hist) < BB_PERIOD + 2:
-                            all_timeframes_match = False
-                            break
-
-                        closes = hist['Close'].tolist()
-                        current_price = closes[-1]
-                        last_candle_ts = int(hist.index[-1].timestamp())
-                        
-                        lower_band, mean_band, upper_band = bollinger_bands(closes)
-                        
-                        # BB logic
-                        bb_match = current_price > upper_band
-                        
-                        # RSI logic (if enabled)
-                        rsi_match = True
-                        current_rsi = None
-                        if USE_RSI:
-                            current_rsi = calculate_rsi(closes)
-                            rsi_match = current_rsi > RSI_OVERBOUGHT
-                        
-                        if bb_match and rsi_match:
-                            tf_metrics.append((timeframe, current_price, upper_band, current_rsi))
-                            alert_key_parts.append(f"{timeframe}_{last_candle_ts}")
-                        else:
-                            all_timeframes_match = False
-                            break
-
-                    if all_timeframes_match and tf_metrics:
-                        alert_key = f"stock_{'_'.join(alert_key_parts)}"
-                        if await self.db.is_alert_sent(symbol_stat.symbol, alert_key):
-                            return
-
-                        logging.info("!!! STOCK SIGNAL DETECTED (Multi-TF): %s !!!", symbol_stat.symbol)
-                        
-                        exchange_link = self._get_yahoo_link(symbol_stat.symbol)
-                        
-                        metrics_lines = []
-                        for tf, price, upper, rsi in tf_metrics:
-                            rsi_text = f", RSI={rsi:.1f}" if rsi is not None else ""
-                            metrics_lines.append(f"• {tf}: Price={price:.2f}, Upper={upper:.2f}{rsi_text}")
-                        
-                        metrics_text = "\n".join(metrics_lines)
-                        msg = (
-                            "📈 <b>STOCK SHORT signal detected (Multi-TF Confirmation)</b>\n"
-                            f"Symbol: <b>{symbol_stat.symbol}</b>\n"
-                            f"Type: <i>US Stock</i>\n"
-                            f"Confirmed on: {', '.join(STOCK_TIMEFRAMES)}\n"
-                            f"{metrics_text}\n\n"
-                            f"🔗 <a href='{exchange_link}'>View on Yahoo Finance</a>"
-                        )
-                        
-                        await self.db.save_alert(symbol_stat.symbol, alert_key, message_text=msg)
-                        
-                        # Use the last timeframe's data for the chart
-                        last_closes = tf_metrics[-1][1] # This is current price, we need list
-                        # Re-fetching list for the last one
-                        hist_last = await loop.run_in_executor(None, lambda: ticker.history(period="5d", interval=STOCK_TIMEFRAMES[-1]))
-                        closes_list = hist_last['Close'].tolist()
-                        l, m, u = bollinger_bands(closes_list)
-                        
-                        chart_buf = self._create_chart(symbol_stat.symbol, closes_list[-50:], u, l, m, timeframe=STOCK_TIMEFRAMES[-1])
-                        await self.send_telegram_photo(chart_buf, msg)
-                        
-                        logging.info("Stock Signal: %s | multi-tf confirmed", symbol_stat.symbol)
-                except Exception as exc:
-                    logging.warning("Failed stock %s: %s", symbol_stat.symbol, exc)
 
     async def evaluate_commodity(self, symbol: str) -> None:
         """Evaluate a single commodity for BB/RSI signals on multiple timeframes using MEXC."""
@@ -835,21 +629,6 @@ class TopGainersBot:
             except Exception as exc:
                 logging.error("Telegram photo error for %s: %s", chat_id, exc)
 
-    async def _stock_symbols_scheduler(self) -> None:
-        while not self.stop_event.is_set():
-            started = time.monotonic()
-            try:
-                await self.refresh_top_stocks()
-            except Exception as exc:
-                logging.exception("Stock list refresh failed: %s", exc)
-
-            elapsed = time.monotonic() - started
-            wait_for = max(1, int(TOP_REFRESH_SECONDS - elapsed))
-            try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
-            except asyncio.TimeoutError:
-                pass
-
     async def _commodity_signal_scheduler(self) -> None:
         """Periodically check for signals on the predefined list of commodities."""
         while not self.stop_event.is_set():
@@ -863,29 +642,6 @@ class TopGainersBot:
 
             elapsed = time.monotonic() - started
             # Use the same interval as stocks for consistency
-            wait_for = max(1, int(CHECK_INTERVAL_SECONDS - elapsed))
-            try:
-                await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
-            except asyncio.TimeoutError:
-                pass
-
-    async def _stock_signal_scheduler(self) -> None:
-        while not self.stop_event.is_set():
-            started = time.monotonic()
-            try:
-                if self.is_scanning:
-                    async with self.stock_symbols_lock:
-                        snapshot = list(self.stock_symbols)
-                    
-                    if snapshot:
-                        logging.info("Checking %s stocks...", len(snapshot))
-                        await asyncio.gather(*(self.evaluate_stock(s) for s in snapshot))
-                else:
-                    logging.info("Stock scanning is currently disabled. Use /start to resume.")
-            except Exception as exc:
-                logging.exception("Stock signal check failed: %s", exc)
-
-            elapsed = time.monotonic() - started
             wait_for = max(1, int(CHECK_INTERVAL_SECONDS - elapsed))
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=wait_for)
@@ -1076,7 +832,7 @@ class TopGainersBot:
                                         "🔍 /check &lt;symbol&gt; - Manual signal check\n"
                                         "📍 /last - Show last signal details\n"
                                         "❓ /help - Show this menu\n\n"
-                                        f"<i>Scanning crypto, stocks, and commodities.</i>"
+                                        f"<i>Scanning crypto and commodities.</i>"
                                     )
                                     payload = {"chat_id": chat_id, "text": help_text, "parse_mode": "HTML"}
                                     await self.http_session.post(url_send, json=payload)
