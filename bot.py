@@ -735,8 +735,11 @@ class TopGainersBot:
 
     async def _update_listener(self) -> None:
         """Listens for incoming messages to help user find Chat IDs."""
-        # Wait a bit for other instances to shut down
-        await asyncio.sleep(5)
+        # Wait longer for Render to kill the old instance (overlap period)
+        # 45 seconds is usually enough for a standard Render deployment
+        wait_seconds = 45 if os.getenv("RENDER") else 5
+        logging.info("Telegram Listener: waiting %s seconds for deployment stabilization...", wait_seconds)
+        await asyncio.sleep(wait_seconds)
         
         last_update_id = 0
         url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
@@ -750,6 +753,9 @@ class TopGainersBot:
                     if results:
                         last_update_id = results[-1]["update_id"]
                         logging.info("Cleared old Telegram updates. Starting listener from update %s", last_update_id)
+                elif resp.status == 409:
+                    logging.warning("Telegram 409 Conflict during startup. Another instance is likely still running.")
+                    # Fall through to loop which handles retries
         except Exception as exc:
             logging.warning("Failed to clear initial Telegram updates: %s", exc)
 
@@ -837,13 +843,18 @@ class TopGainersBot:
                                     await self.http_session.post(url_send, json=payload)
 
                                 logging.info("--------------------------------")
+                    elif resp.status == 409:
+                        logging.warning("Telegram 409 Conflict: Another instance is running. Waiting 20s before retry...")
+                        await asyncio.sleep(20)
                     else:
                         logging.error("Telegram Listener failed [%s]: %s", resp.status, await resp.text())
+                        await asyncio.sleep(5) # Delay on other errors
             except asyncio.TimeoutError:
                 # Expected behavior for long polling, just ignore and continue
                 pass
             except Exception as exc:
                 logging.exception("Update listener exception: %s", exc)
+                await asyncio.sleep(5) # Delay on exceptions
             
             await asyncio.sleep(1)
 
