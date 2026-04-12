@@ -196,9 +196,14 @@ class TopGainersBot:
         return True
 
     async def start(self) -> None:
-        # Increase max_field_size for Yahoo Finance headers. 
-        # Large cookies/headers from Yahoo can exceed the default 8KB.
-        # Set to 64KB (65536) to be safe as seen in error logs (29899 bytes).
+        # 1. Start web server FIRST to satisfy Render health check quickly
+        # This prevents Render from starting a second instance while this one is still "starting"
+        web_server_task = asyncio.create_task(self._start_dummy_web_server())
+        
+        # Give web server a tiny bit of time to bind
+        await asyncio.sleep(0.5)
+
+        # 2. Setup bot resources
         self.http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             max_field_size=65536
@@ -232,14 +237,7 @@ class TopGainersBot:
         
         await self.send_telegram(startup_msg)
 
-        # 1. Start web server FIRST to satisfy Render health check quickly
-        # This prevents Render from starting a second instance while this one is still "starting"
-        web_server_task = asyncio.create_task(self._start_dummy_web_server())
-        
-        # Give web server a second to bind to the port
-        await asyncio.sleep(2)
-
-        # 2. Run bot tasks
+        # 3. Run bot tasks
         tasks = [
             self._top_symbols_scheduler(),
             self._signal_scheduler(),
@@ -264,6 +262,7 @@ class TopGainersBot:
         async def handle(request):
             return web.Response(text="Bot is running!")
         app.router.add_get('/', handle)
+        app.router.add_get('/health', handle)
         
         # Render uses port 10000 by default for its health check
         port = int(os.getenv("PORT", "10000"))
